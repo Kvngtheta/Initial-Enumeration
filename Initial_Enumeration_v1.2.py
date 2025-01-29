@@ -1,17 +1,17 @@
 import os
 import re
-import subprocess
+import json
 import asyncio
-import ipaddress
 import logging
-from tqdm import tqdm
+import ipaddress
+import subprocess
 from signal import signal, SIGINT
 from concurrent.futures import ThreadPoolExecutor
 
 # Configure logging
 logging.basicConfig(filename="enumeration.log", level=logging.INFO, format="%(asctime)s - %(message)s")
 
-# Centralized configuration
+# Configuration
 CONFIG = {
     "wordlist": "/usr/share/wordlists/dirb/common.txt",
     "max_threads": 5,
@@ -34,101 +34,93 @@ def validate_ip(ip):
     except ValueError:
         return False
 
-def run_command(command):
-    """Run a system command and return the output."""
-    try:
-        result = subprocess.run(command, shell=True, capture_output=True, text=True)
-        result.check_returncode()
-        return result.stdout.strip()
-    except subprocess.CalledProcessError as e:
-        logging.error(f"Error running command: {command}\n{e.stderr}")
-        return ""
+async def run_command(command):
+    """Run a system command asynchronously."""
+    proc = await asyncio.create_subprocess_shell(
+        command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        logging.error(f"Error running command: {command}\n{stderr.decode().strip()}")
+    return stdout.decode().strip()
 
 def write_to_file(filename, data):
-    """Write data to a file."""
+    """Write data to a JSON file."""
     os.makedirs(CONFIG["output_directory"], exist_ok=True)
     filepath = os.path.join(CONFIG["output_directory"], filename)
     with open(filepath, "a") as f:
-        f.write(data + "\n")
-
-def live_update(message, highlight=False):
-    """Print live updates to the console."""
-    if highlight:
-        print(f"\033[91m[+] {message}\033[0m")  # Red font for highlights
-    else:
-        print(f"[+] {message}")
+        json.dump(data, f, indent=4)
+        f.write("\n")
 
 def parse_ports(output):
     """Parse open ports by service type."""
     services = {"http": [], "https": [], "smb": [], "ftp": []}
     for line in output.splitlines():
-        if "http" in line and not "ssl" in line:
-            services["http"].append(re.search(r"(\d+)/tcp", line).group(1))
-        elif "ssl/http" in line:
-            services["https"].append(re.search(r"(\d+)/tcp", line).group(1))
-        elif "smb" in line:
-            services["smb"].append(re.search(r"(\d+)/tcp", line).group(1))
-        elif "ftp" in line:
-            services["ftp"].append(re.search(r"(\d+)/tcp", line).group(1))
+        match = re.search(r"(\d+)/tcp", line)
+        if match:
+            port = match.group(1)
+            if "http" in line and "ssl" not in line:
+                services["http"].append(port)
+            elif "ssl/http" in line:
+                services["https"].append(port)
+            elif "smb" in line:
+                services["smb"].append(port)
+            elif "ftp" in line:
+                services["ftp"].append(port)
     return services
 
 async def nmap_scan(ip):
-    """Run nmap and return results."""
-    live_update(f"Starting Nmap scan on {ip}...")
-    command = f"nmap -Pn {CONFIG['output_directory']}/nmap-scan-results.txt --script vulners.nse -sV -p- {ip}"
-    output = run_command(command)
-    live_update("Nmap scan complete. Results saved.")
-    return output
+    """Run Nmap scan and return results."""
+    command = f"nmap -Pn -sV -p- --script vulners {ip} -oN {CONFIG['output_directory']}/nmap-scan-results.txt"
+    return await run_command(command)
 
 async def wfuzz_scan(ip, ports, protocol="http"):
-    """Run wfuzz scans for given ports."""
-    results_file = f"wfuzz-{protocol}-results.txt"
+    """Run wfuzz scans."""
+    results_file = f"wfuzz-{protocol}-results.json"
+    results = []
     for port in ports:
         url = f"{protocol}://{ip}:{port}/FUZZ.FUZ2Z"
-        live_update(f"Scanning {url} with wfuzz...")
         command = f"wfuzz -w {CONFIG['wordlist']} -u '{url}' --hc 404 -z list,.php,.txt,.log,.html"
-        output = run_command(command)
-        write_to_file(results_file, output)
-        if any(keyword in output for keyword in CONFIG["interesting_keywords"]):
-            live_update(f"Interesting findings in {url}!", highlight=True)
-    live_update(f"Wfuzz scan complete. Results saved to {results_file}.")
+        output = await run_command(command)
+        results.append({"url": url, "output": output})
+    write_to_file(results_file, results)
 
 async def nikto_scan(ip, ports, protocol="http"):
-    """Run nikto scans for given ports."""
-    results_file = f"nikto-{protocol}-results.txt"
+    """Run Nikto scans."""
+    results_file = f"nikto-{protocol}-results.json"
+    results = []
     for port in ports:
         url = f"{protocol}://{ip}:{port}"
-        live_update(f"Running Nikto on {url}...")
         command = f"nikto -h {url} -nointeractive -maxtime 360"
-        output = run_command(command)
-        write_to_file(results_file, output)
-        live_update(f"Nikto scan for {url} complete.")
+        output = await run_command(command)
+        results.append({"url": url, "output": output})
+    write_to_file(results_file, results)
 
 async def enum4linux_scan(ip):
     """Run enum4linux against the target IP."""
-    live_update(f"Running enum4linux on {ip}...")
     command = f"enum4linux {ip} > {CONFIG['output_directory']}/linux-enum.txt"
-    run_command(command)
-    live_update("Enum4linux scan complete. Results saved.")
+    await run_command(command)
 
 async def perform_curl(ip, file):
     """Use curl to fetch discovered files."""
-    live_update("Running curl on discovered URLs...")
+    semaphore = asyncio.Semaphore(10)  # Limit concurrency
+    results = []
+    async def fetch(url):
+        async with semaphore:
+            return await run_command(f"curl {url}")
+    
     with open(file, "r") as f:
         urls = [line.strip() for line in f if line.strip()]
+    
     if len(urls) > 1000:
-        live_update("1000+ pages found. Skipping curl (check wfuzz results manually).")
-        return
-
-    results_file = "curl-results.txt"
-    async def fetch(url):
-        return run_command(f"curl {url}")
+        return  # Skip to avoid overload
 
     tasks = [fetch(url) for url in urls]
-    results = await asyncio.gather(*tasks)
-    for result in results:
-        write_to_file(results_file, result)
-    live_update(f"Curl fetch complete. Results saved to {results_file}.")
+    responses = await asyncio.gather(*tasks)
+    
+    for url, response in zip(urls, responses):
+        results.append({"url": url, "content": response})
+    write_to_file("curl-results.json", results)
 
 async def main():
     ip = input("Enter target IP: ")
@@ -138,33 +130,22 @@ async def main():
 
     # Run Nmap scan
     nmap_results = await nmap_scan(ip)
-
-    # Parse ports from Nmap results
     services = parse_ports(nmap_results)
 
-    # Run wfuzz scans
-    wfuzz_tasks = []
+    # Run scans concurrently
+    tasks = []
     if services["http"]:
-        wfuzz_tasks.append(wfuzz_scan(ip, services["http"], "http"))
+        tasks.append(wfuzz_scan(ip, services["http"], "http"))
+        tasks.append(nikto_scan(ip, services["http"], "http"))
     if services["https"]:
-        wfuzz_tasks.append(wfuzz_scan(ip, services["https"], "https"))
-
-    # Run Nikto scans
-    nikto_tasks = []
-    if services["http"]:
-        nikto_tasks.append(nikto_scan(ip, services["http"], "http"))
-    if services["https"]:
-        nikto_tasks.append(nikto_scan(ip, services["https"], "https"))
-
-    # Run enum4linux if SMB is detected
-    enum4linux_task = None
+        tasks.append(wfuzz_scan(ip, services["https"], "https"))
+        tasks.append(nikto_scan(ip, services["https"], "https"))
     if services["smb"]:
-        enum4linux_task = enum4linux_scan(ip)
-
-    # Await all tasks
-    await asyncio.gather(*wfuzz_tasks, *nikto_tasks, enum4linux_task)
-
-    live_update("Enumeration complete. Check results for details.")
+        tasks.append(enum4linux_scan(ip))
+    
+    await asyncio.gather(*tasks)
+    print("Enumeration complete. Check results for details.")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    with ThreadPoolExecutor(max_workers=CONFIG["max_threads"]) as executor:
+        executor.submit(asyncio.run, main())
