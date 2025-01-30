@@ -71,7 +71,7 @@ def parse_ports(output):
 
 async def nmap_scan(ip):
     """Run Nmap scan and return results."""
-    command = f"nmap -Pn -sV -p- --script vulners {ip} -oN {CONFIG['output_directory']}/nmap-scan-results.txt"
+    command = f"nmap -Pn -sV -p- --script=vulners {ip} -oN {CONFIG['output_directory']}-nmap-scan-results.txt"
     return await run_command(command)
 
 async def wfuzz_scan(ip, ports, protocol="http"):
